@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 import os
+import datetime
 import json
 import time
 import math
 
+import pyactiveresource
+import shopify
 import singer
 from singer import utils
 from singer import metadata
 from singer import Transformer
-import pyactiveresource
-import shopify
+from tap_shopify.context import Context
+import tap_shopify.streams # Load stream objects into Context
 
-REQUIRED_CONFIG_KEYS = ["api_key"]
+REQUIRED_CONFIG_KEYS = ["shop", "api_key"]
 LOGGER = singer.get_logger()
-RESULTS_PER_PAGE = 250
 
-def initialize_shopify_client(config):
-    api_key = config['api_key']
-    shop = config['shop']
-    session = shopify.Session("%s.myshopify.com" % (shop),
-                              api_key)
-    activate_resp = shopify.ShopifyResource.activate_session(session)
-
+def initialize_shopify_client():
+    api_key = Context.config['api_key']
+    shop = Context.config['shop']
+    session = shopify.Session(shop, api_key)
+    shopify.ShopifyResource.activate_session(session)
 
 def get_abs_path(path):
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
@@ -34,16 +34,14 @@ def load_schemas():
     # 'number's, which may result in lost precision.
     for filename in os.listdir(get_abs_path('schemas')):
         path = get_abs_path('schemas') + '/' + filename
-        file_raw = filename.replace('.json', '')
+        schema_name = filename.replace('.json', '')
         with open(path) as file:
-            raw_dict = json.load(file)
-            schema = singer.resolve_schema_references(raw_dict, raw_dict)
-            schemas[file_raw] = schema
+            schemas[schema_name] = json.load(file)
 
     return schemas
 
 
-def get_discovery_metadata(stream):
+def get_discovery_metadata(stream, schema):
     mdata = metadata.new()
     mdata = metadata.write(mdata, (), 'table-key-properties', stream.key_properties)
     mdata = metadata.write(mdata, (), 'forced-replication-method', stream.replication_method)
@@ -51,7 +49,7 @@ def get_discovery_metadata(stream):
     if stream.replication_key:
         mdata = metadata.write(mdata, (), 'valid-replication-keys', [stream.replication_key])
 
-    for field_name in stream.schema['properties'].keys():
+    for field_name in schema['properties'].keys():
         if field_name in stream.key_properties or field_name == stream.replication_key:
             mdata = metadata.write(mdata, ('properties', field_name), 'inclusion', 'automatic')
         else:
@@ -59,152 +57,105 @@ def get_discovery_metadata(stream):
 
     return metadata.to_list(mdata)
 
+def load_schema_references():
+    shared_schema_file = "definitions.json"
+    shared_schema_path = get_abs_path('schemas/')
+
+    refs = {}
+    with open(os.path.join(shared_schema_path, shared_schema_file)) as data_file:
+        refs[shared_schema_file] = json.load(data_file)
+
+    return refs
 
 def discover():
     raw_schemas = load_schemas()
     streams = []
 
+    refs = load_schema_references()
     for schema_name, schema in raw_schemas.items():
+        if schema_name not in Context.stream_objects:
+            continue
 
-        stream = STREAMS[schema_name](schema)
+        stream = Context.stream_objects[schema_name]()
 
         # create and add catalog entry
         catalog_entry = {
             'stream': schema_name,
             'tap_stream_id': schema_name,
-            'schema': schema,
-            'metadata' : get_discovery_metadata(stream),
-            'key_properties': stream.key_properties
+            'schema': singer.resolve_schema_references(schema, refs),
+            'metadata' : get_discovery_metadata(stream, schema),
+            'key_properties': stream.key_properties,
+            'replication_key': stream.replication_key,
+            'replication_method': stream.replication_method
         }
         streams.append(catalog_entry)
 
     return {'streams': streams}
 
-class Stream():
-    name = None
-    replication_method = None
-    replication_key = None
-    key_properties = None
-    schema = None
-
-    def __init__(self, schema):
-        self.schema = schema
-
-    def get_bookmark(self, state, config):
-        bookmark = singer.get_bookmark(state, self.name, self.replication_key) or config["start_date"]
-        return utils.strptime_with_tz(bookmark)
-
-    def update_bookmark(self, state, value):
-        current_bookmark = self.get_bookmark(state)
-        if value and utils.strptime_with_tz(value) > current_bookmark:
-            singer.write_bookmark(state, self.name, self.replication_key, value)
-
-
-class Orders(Stream):
-    name = 'orders'
-    replication_method = 'INCREMENTAL'
-    replication_key = 'updated_at'
-    key_properties = ['id']
-
-    def __init__(self, schema):
-        self.schema = schema
-
-    def sync(self, config, state):
-        page = 1
-        start_date = self.get_bookmark(state, config)
-        count = 0
-
-        while True:
-            try:
-                orders = shopify.Order.find(
-                    # Max allowed value as of 2018-09-19 11:53:48
-                    limit=RESULTS_PER_PAGE,
-                    page=page,
-                    updated_at_min=start_date,
-                    # Order is an undocumented query param that we believe
-                    # ensures the order of the results.
-                    order="updated_at asc")
-
-            except pyactiveresource.connection.ClientError as client_error:
-                # We have never seen this be anything _but_ a 429. Other
-                # states should be consider untested.
-                resp = client_error.response
-                if resp.code == 429:
-                    # Retry-After is an undocumented header. But honoring
-                    # it was proven to work in our spikes.
-                    sleep_time_str = resp.headers['Retry-After']
-                    LOGGER.info("Received 429 -- sleeping for %s seconds", sleep_time_str)
-                    time.sleep(math.floor(float(sleep_time_str)))
-                    continue
-                else:
-                    LOGGER.ERROR("Received a {} error.".format(resp.code))
-                    raise
-            for order in orders:
-                singer.write_bookmark(state,
-                                      self.name,
-                                      self.replication_key,
-                                      order.updated_at)
-                yield order.to_dict()
-                count += 1
-
-            singer.write_state(state)
-            if len(orders) < RESULTS_PER_PAGE:
-                break
-            page += 1
-        LOGGER.info('Count = {}'.format(count))
-
-
-def get_selected_streams(catalog):
+def shuffle_streams(stream_name):
     '''
-    Gets selected streams.  Checks schema's 'selected' first (legacy)
-    and then checks metadata (current), looking for an empty breadcrumb
-    and mdata with a 'selected' entry
+    Takes the name of the first stream to sync and reshuffles the order
+    of the list to put it at the top
     '''
-    selected_streams = []
-    for stream in catalog['streams']:
-        stream_metadata = stream['metadata']
-        if stream['schema'].get('selected', False):
-            selected_streams.append(stream['tap_stream_id'])
-        else:
-            for entry in stream_metadata:
-                # stream metadata will have empty breadcrumb
-                if not entry['breadcrumb'] and entry['metadata'].get('selected', None):
-                    selected_streams.append(stream['tap_stream_id'])
+    matching_index = 0
+    for i, catalog_entry in enumerate(Context.catalog["streams"]):
+        if catalog_entry["tap_stream_id"] == stream_name:
+            matching_index = i
+    top_half = Context.catalog["streams"][matching_index:]
+    bottom_half = Context.catalog["streams"][:matching_index]
+    Context.catalog["streams"] = top_half + bottom_half
 
-    return selected_streams
+def sync():
+    initialize_shopify_client()
 
+    # Emit all schemas first so we have them for child streams
+    for stream in Context.catalog["streams"]:
+        if Context.is_selected(stream["tap_stream_id"]):
+            singer.write_schema(stream["tap_stream_id"],
+                                stream["schema"],
+                                stream["key_properties"],
+                                bookmark_properties=stream["replication_key"])
+            Context.counts[stream["tap_stream_id"]] = 0
 
-STREAMS = {
-    'orders': Orders
-}
-
-
-def sync(config, state, catalog):
-
-    selected_stream_ids = get_selected_streams(catalog)
+    # If there is a currently syncing stream bookmark, shuffle the
+    # stream order so it gets sync'd first
+    currently_sync_stream_name = Context.state.get('bookmarks', {}).get('currently_sync_stream')
+    if currently_sync_stream_name:
+        shuffle_streams(currently_sync_stream_name)
 
     # Loop over streams in catalog
-    for catalog_entry in catalog['streams']:
+    for catalog_entry in Context.catalog['streams']:
         stream_id = catalog_entry['tap_stream_id']
-        stream_schema = catalog_entry['schema']
-        stream = STREAMS[stream_id](stream_schema)
-        stream_metadata = metadata.to_map(catalog_entry['metadata'])
+        stream = Context.stream_objects[stream_id]()
 
-        initialize_shopify_client(config)
+        if not Context.is_selected(stream_id):
+            LOGGER.info('Skipping stream: %s', stream_id)
+            continue
 
+        LOGGER.info('Syncing stream: %s', stream_id)
 
-        if stream_id in selected_stream_ids:
-            LOGGER.info('Syncing stream: %s', stream_id)
+        if not Context.state.get('bookmarks'):
+            Context.state['bookmarks'] = {}
+        Context.state['bookmarks']['currently_sync_stream'] = stream_id
 
-            # write schema message
-            singer.write_schema(stream.name, stream.schema, stream.key_properties)
+        with Transformer() as transformer:
+            for rec in stream.sync():
+                extraction_time = singer.utils.now()
+                record_schema = catalog_entry['schema']
+                record_metadata = metadata.to_map(catalog_entry['metadata'])
+                rec = transformer.transform(rec, record_schema, record_metadata)
+                singer.write_record(stream_id,
+                                    rec,
+                                    time_extracted=extraction_time)
+                Context.counts[stream_id] += 1
 
-            # sync
-            with Transformer() as transformer:
-                for rec in stream.sync(config, state):
-                    rec = transformer.transform(rec, stream.schema, stream_metadata)
-                    singer.write_record(stream.name, rec)
+        Context.state['bookmarks'].pop('currently_sync_stream')
+        singer.write_state(Context.state)
 
+    LOGGER.info('----------------------')
+    for stream_id, stream_count in Context.counts.items():
+        LOGGER.info('%s: %d', stream_id, stream_count)
+    LOGGER.info('----------------------')
 
 @utils.handle_top_exception(LOGGER)
 def main():
@@ -218,17 +169,15 @@ def main():
         print(json.dumps(catalog, indent=2))
     # Otherwise run in sync mode
     else:
-
-        # 'properties' is the legacy name of the catalog
-        if args.properties:
-            catalog = args.properties
-        # 'catalog' is the current name
-        elif args.catalog:
-            catalog = args.catalog
+        Context.tap_start = utils.now()
+        if args.catalog:
+            Context.catalog = args.catalog.to_dict()
         else:
-            catalog = discover()
+            Context.catalog = discover()
 
-        sync(args.config, args.state, catalog)
+        Context.config = args.config
+        Context.state = args.state
+        sync()
 
 if __name__ == "__main__":
     main()
